@@ -1,0 +1,508 @@
+package database
+
+import (
+	"database/sql"
+	"encoding/json"
+	"math"
+	"strconv"
+	"strings"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+/*
+默认mysql配置，方便不用每次实例化mysql类的时候都输入参数
+*/
+var (
+	DefaultMysqlConfig MysqlConfig
+)
+
+//---------------------------------------------------------------
+type MysqlConfig struct {
+	Host     string //数据库服务器
+	Port     string //端口
+	User     string //用户名
+	Pswd     string //密码
+	Database string //数据库名
+	Charset  string //字符编码
+}
+
+//---------------------------------------------------------------
+type Mysql struct {
+	dbDB  *sql.DB //正常的mysql资源
+	dbTX  *sql.Tx //开启事务处理的mysql资源
+	trans bool    //是否开启事务，true开启事务，false关闭
+}
+
+/*
+实例化一个数据库对象，默认使用本包的DefaultMysqlConfig作为配置数据，也可自行传入参数
+*/
+func NewMysql(arg ...MysqlConfig) (mysql *Mysql, err error) {
+	var config MysqlConfig
+	if len(arg) == 0 {
+		config = DefaultMysqlConfig
+	} else {
+		config = arg[0]
+	}
+	db, err := sql.Open("mysql", config.User+":"+config.Pswd+"@tcp("+config.Host+":"+config.Port+")/"+config.Database+"?charset="+config.Charset)
+	if err != nil {
+		return
+	}
+	mysql = new(Mysql)
+	mysql.dbDB = db
+	mysql.trans = false
+	return
+}
+
+/*
+判断数据库是否连接成功
+*/
+func (this *Mysql) Check() {
+
+}
+
+/*
+事务开始
+*/
+func (this *Mysql) Begin() {
+	this.trans = true
+	this.dbTX, _ = this.dbDB.Begin()
+}
+
+func (this *Mysql) Close() {
+	this.dbDB.Close()
+}
+
+/*
+事务回滚
+*/
+func (this *Mysql) Rollback() {
+	this.dbTX.Rollback()
+}
+
+/*
+事务提交
+*/
+func (this *Mysql) Commit(arg ...bool) {
+	isok := true
+	for _, v := range arg {
+		if v == false {
+			isok = false
+			break
+		}
+	}
+	if isok == true {
+		this.trans = false
+		this.dbTX.Commit()
+	}
+}
+
+/*
+通过mysql对象实例化表
+*/
+func (this *Mysql) Table(name string) (t *msyqlTable) {
+	t = new(msyqlTable)
+	t.name = name
+	t.data = make(MysqlData)
+	t.pageSize = 20
+	t.mysql = this
+	return
+}
+
+/*
+query封装，用于区别是否开启事务
+*/
+func (this *Mysql) Query(sqlS string, arg ...interface{}) (result []MysqlData, err error) {
+	var rows *sql.Rows
+	//Dp(sqlS, " ,参数： ", arg)
+	if this.trans {
+		rows, err = this.dbTX.Query(sqlS, arg...)
+	} else {
+		rows, err = this.dbDB.Query(sqlS, arg...)
+	}
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	iLen := len(columns)
+	values := make([]sql.RawBytes, iLen)
+	scans := make([]interface{}, iLen)
+	for i := range values {
+		scans[i] = &values[i]
+	}
+	for rows.Next() {
+		rows.Scan(scans...)
+		each := make(MysqlData)
+		for i, col := range values {
+			each[columns[i]] = string(col)
+		}
+		result = append(result, each)
+	}
+	return
+}
+
+/*
+exec封装，用于区别是否开启事务
+*/
+func (this *Mysql) QueryRow(sqlS string, arg ...interface{}) (row *sql.Row) {
+	//Dp(sqlS, " ,参数： ", arg)
+	if this.trans {
+		row = this.dbTX.QueryRow(sqlS, arg...)
+	} else {
+		row = this.dbDB.QueryRow(sqlS, arg...)
+	}
+	return
+}
+
+/*
+exec封装，用于区别是否开启事务
+*/
+func (this *Mysql) Exec(sqlS string, arg ...interface{}) (result sql.Result, err error) {
+	//Dp(sqlS, " ,参数： ", arg)
+	if this.trans {
+		result, err = this.dbTX.Exec(sqlS, arg...)
+	} else {
+		result, err = this.dbDB.Exec(sqlS, arg...)
+	}
+	return
+}
+
+//---------------------------------------------------------------
+/*
+分页结构体
+*/
+type MysqlPageStore struct {
+	Now    int //当前页码
+	Max    int //最大页码
+	RowNum int //数据总数
+}
+type MysqlData map[string]string
+
+/*
+表类
+*/
+type msyqlTable struct {
+	mysql     *Mysql
+	arg       []interface{}  //where使用
+	prefix    string         //表前缀
+	name      string         //表名
+	field     string         //查询字段
+	data      MysqlData      //输入的字段
+	sql       string         //sql语句
+	page      int            //当前页面
+	pageSize  int            //页面大小
+	pagestore MysqlPageStore //页码数据
+}
+
+/*
+需要查询的字段
+*/
+func (this *msyqlTable) Field(cols string) *msyqlTable {
+	this.field = cols
+	return this
+}
+
+/*
+查询条件，请不要输入where，
+*/
+func (this *msyqlTable) Where(sql string, arg ...interface{}) *msyqlTable {
+	if sql != "" {
+		this.sql = " WHERE " + sql
+	}
+	this.arg = arg
+	return this
+}
+
+//排序类型
+func (this *msyqlTable) Order(sql string) *msyqlTable {
+	this.sql = this.sql + " ORDER BY " + sql
+	return this
+}
+
+/*
+页码条件（只能配合select使用）
+page  页码
+size  每页显示数量
+*/
+func (this *msyqlTable) Page(page, size int) *msyqlTable {
+	this.page = page
+	this.pageSize = size
+	return this
+}
+
+/*
+查询结果
+arg可以输入多个条件用于匹配where里面的?
+*/
+func (this *msyqlTable) Select() (arr []MysqlData, page MysqlPageStore, err error) {
+	sqlstr := "SELECT " + this.field + " FROM " + this.name + this.sql + this.getPageSql()
+	arr, err = this.mysql.Query(sqlstr, this.arg...)
+	return arr, this.pagestore, err
+}
+
+/*
+查询单条数据结果
+arg可以输入多个条件用于匹配where里面的?
+*/
+func (this *msyqlTable) SelectOne() (arr MysqlData, err error) {
+	sqlstr := "SELECT " + this.field + " FROM " + this.name + this.sql + " LIMIT 1 "
+	arrs, err := this.mysql.Query(sqlstr, this.arg...)
+	if len(arrs) == 0 {
+		return
+	}
+	return arrs[0], err
+}
+
+/*
+增改操作的数据输入
+data 数组
+*/
+func (this *msyqlTable) Data(data MysqlData) *msyqlTable {
+	this.data = data
+	return this
+}
+
+/*
+插入数据，返回自增长id
+*/
+func (this *msyqlTable) Insert() (lastInsertId int64, err error) {
+	var result sql.Result
+	sqlaS, argA := this.arr2insert(this.data)
+	sqlS := "INSERT INTO " + this.name + sqlaS
+	argA = append(argA, this.arg...)
+	result, err = this.mysql.Exec(sqlS, argA...)
+	lastInsertId, _ = result.LastInsertId()
+	return
+}
+
+/*
+修改数据，返回受影响的行数
+*/
+func (this *msyqlTable) Update() (rowsAffected int64, err error) {
+	var result sql.Result
+	sqlaS, argA := this.arr2update(this.data)
+	sqlS := "UPDATE " + this.name + " SET " + sqlaS + this.sql
+	argA = append(argA, this.arg...)
+	result, err = this.mysql.Exec(sqlS, argA...)
+	rowsAffected, _ = result.LastInsertId()
+	return
+}
+
+/*
+修改单条数据，返回受影响的行数
+*/
+func (this *msyqlTable) UpdateOne() (rowsAffected int64, err error) {
+	this.sql = this.sql + " LIMIT 1"
+	return this.Update()
+}
+
+/*
+删除数据，返回受影响的行数
+*/
+func (this *msyqlTable) Delete() (rowsAffected int64, err error) {
+	var result sql.Result
+	sqlS := "DELETE  FROM " + this.name + this.sql
+	result, err = this.mysql.Exec(sqlS, this.arg...)
+	rowsAffected, _ = result.RowsAffected()
+	return
+}
+
+/*
+删除单条数据，返回受影响的行数
+*/
+func (this *msyqlTable) DeleteOne() (affectedNums int64, err error) {
+	this.sql = this.sql + " LIMIT 1"
+	return this.Delete()
+}
+
+/*
+判断表是否存在
+*/
+func (this *msyqlTable) Exists() (errE bool) {
+	arrA, _ := this.mysql.Query("SHOW TABLES")
+	errE = false
+	for _, aCloum := range arrA {
+		for _, sValue := range aCloum {
+			if sValue == this.name {
+				errE = true
+				return
+			}
+		}
+	}
+	return
+}
+
+/*
+获取列名
+*/
+func (this *msyqlTable) Getcloums() (arrA []string, errE error) {
+	sqlS := "SELECT * FROM " + this.name + " LIMIT 1 "
+	cloumsA, errE := this.mysql.Query(sqlS)
+	if errE != nil || len(cloumsA) == 0 {
+		return
+	}
+	for v, _ := range cloumsA[0] {
+		arrA = append(arrA, v)
+	}
+	return
+}
+
+/*
+数组转换为修改sql语句
+*/
+func (this *msyqlTable) arr2update(arr MysqlData) (sqlS string, argA []interface{}) {
+	var sqlA []string
+	for k, v := range arr {
+		if v == "" {
+			continue
+		}
+		sqlA = append(sqlA, "`"+k+"`=?")
+		argA = append(argA, v)
+	}
+	sqlS = strings.Join(sqlA, ",")
+	return
+}
+
+/*
+数组转换为插入sql语句
+*/
+func (this *msyqlTable) arr2insert(arr MysqlData) (sqlS string, argA []interface{}) {
+	var sqlLeftA, sqlRightA []string
+	for k, v := range arr {
+		if v == "" {
+			continue
+		}
+		sqlLeftA = append(sqlLeftA, "`"+k+"`")
+		sqlRightA = append(sqlRightA, "?")
+		argA = append(argA, v)
+	}
+	sqlLeftS := strings.Join(sqlLeftA, ",")
+	sqlRightS := strings.Join(sqlRightA, ",")
+	sqlS = "(" + sqlLeftS + ") values (" + sqlRightS + ")"
+	return
+}
+
+/*
+查询页码信息
+*/
+func (this *msyqlTable) getPageSql() (sql string) {
+	if this.page > 0 {
+		pgSql := "SELECT COUNT(*) AS nums FROM " + this.name + this.sql
+		row := this.mysql.QueryRow(pgSql, this.arg...)
+		var num int
+		row.Scan(&num)
+		this.pagestore = MysqlPageStore{}
+		this.pagestore.Max = int(math.Ceil(float64(num) / float64(this.pageSize))) //math.Ceil
+		if this.page > this.pagestore.Max {
+			this.page = this.pagestore.Max
+		}
+		if this.page < 0 {
+			this.page = 1
+		}
+		this.pagestore.Now = this.page
+		this.pagestore.RowNum = num
+		start := (this.page - 1) * this.pageSize
+		if start < 0 {
+			start = 0
+		}
+		sStart := strconv.Itoa(start)
+		sSize := strconv.Itoa(this.pageSize)
+		sql = " limit " + sStart + "," + sSize
+	}
+	return
+}
+
+//-------------------------------------------------------------
+/*
+回收站
+作用：可以将删除的数据保存下来，方便后面恢复
+*/
+type recycleStore struct {
+	TableName string
+	Data      []MysqlData
+}
+type Recycle struct {
+	recycleTable string //回收站表格名
+	nameS        string //单条删除数据的表名
+	dataCloumS   string //删除数据保存的列名
+	idCloumS     string //删除数据保存的唯一id名
+	mysql        Mysql
+	sqlRecycleA  []recycleStore //此数据用来记录所有的删除数据
+}
+
+/*
+新建一个回收站
+*/
+func NewRecycle(mysql Mysql, recycleTable, idCloumS, dataCloumS string) *Recycle {
+	r := new(Recycle)
+	r.mysql = mysql
+	r.recycleTable = recycleTable
+	r.idCloumS = idCloumS
+	r.dataCloumS = dataCloumS
+	mysql.Begin()
+	return r
+}
+
+/*
+引入表格名称
+*/
+func (this *Recycle) Table(name string) *Recycle {
+	this.nameS = name
+	return this
+}
+
+/*
+删除条件
+*/
+func (this *Recycle) Where(sqlS string, arg ...interface{}) (err error) {
+	var data []MysqlData
+	data, _, err = this.mysql.Table(this.nameS).Where(sqlS, arg...).Select()
+	rs := recycleStore{TableName: this.nameS, Data: data}
+	this.sqlRecycleA = append(this.sqlRecycleA, rs)
+	this.mysql.Table(this.nameS).Where(sqlS, arg...).Delete()
+	return
+}
+
+/*
+完成最后的删除,如果在参数里面给出了delArrA的话，可以增加删除时间，删除人等信息，回收站的表必须有data_id,data字段
+*/
+func (this *Recycle) Delete(delArrA MysqlData) (err bool) {
+	sqlS, _ := json.Marshal(this.sqlRecycleA)
+	delArrA[this.dataCloumS] = string(sqlS)
+	affectedNums, _ := this.mysql.Table(this.recycleTable).Data(delArrA).Insert()
+	if affectedNums > 0 {
+		this.mysql.Commit()
+		err = true
+	} else {
+		this.mysql.Rollback()
+		err = false
+	}
+	return
+}
+
+/*
+还原数据,需提供删除数据的id
+*/
+func (this *Recycle) Back(did int) bool {
+	var data MysqlData
+	var err error
+	data, err = this.mysql.Table(this.recycleTable).Where(this.idCloumS+"=?", did).SelectOne()
+	if err != nil {
+		return false
+	}
+	arrA := data[this.dataCloumS]
+	var sqlRecycleA []recycleStore
+	err = json.Unmarshal([]byte(arrA), sqlRecycleA)
+	for _, v := range sqlRecycleA {
+		for _, data := range v.Data {
+			aid, err := this.mysql.Table(v.TableName).Data(data).Insert()
+			if err != nil || aid <= 0 {
+				this.mysql.Rollback()
+				return false
+			}
+		}
+	}
+	this.mysql.Commit()
+	return true
+}

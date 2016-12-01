@@ -32,13 +32,13 @@ type Session struct {
 	RdsHost    string //redis服务器
 	RdsPaswrod string //redis密码
 	RdsDB      int    //redis数据库编号
-	cache      *cache.Cache
+	cache      cache.Cacher
 	Writer     http.ResponseWriter
 	Request    *http.Request
 }
 
 //创建session时使用
-func (self Session) Use() *cache.Cache {
+func (self Session) Use() cache.Cacher {
 	o := &self
 	sid := o.getCookieSessionId()
 	if sid == "" {
@@ -63,7 +63,7 @@ func (self Session) Use() *cache.Cache {
 }
 
 //使用session时使用
-func (self Session) Get(r *http.Request) *cache.Cache {
+func (self Session) Get(r *http.Request) cache.Cacher {
 	o := &self
 	o.Request = r
 	sid := o.getCookieSessionId()
@@ -85,7 +85,7 @@ func (this *Session) getCookieSessionId() string {
 
 //初始化缓存数据库
 func (this *Session) initCache(sid string) {
-	this.cache = cache.New(cache.Redis(SESSION_REDIS_HOST, SESSION_REDIS_PSWD, SESSION_REDIS_DB, sid))
+	this.cache = cache.NewRedis(SESSION_REDIS_HOST, SESSION_REDIS_PSWD, SESSION_REDIS_DB, sid)
 }
 
 //创建session id

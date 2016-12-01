@@ -1,1 +1,1 @@
-guard site.exe
+guard -t=10 -n=10 -c="bee"

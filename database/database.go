@@ -12,15 +12,23 @@ import (
 )
 
 var (
+	DO_INVALID = errors.New("数据操作无效")
+	DO_FAIL    = errors.New("数据查询失败")
+)
+
+var (
 	Engine *xorm.Engine //数据库引擎,引入该包的时候来初始化
 )
 
 type Model struct {
-	obj           interface{}  `xorm:"="` //继承者使用该对象
-	id            *int32       `xorm:"="` //主键编号
-	session       *Session     `xorm:"="` //数据库会话
-	isRootSession bool         `xorm:"="` //是否为根会话
-	engine        *xorm.Engine `xorm:"="` //数据库引擎，默认为配置的数据库引擎
+	omit          []string     //去除
+	cols          []string     //需要的列
+	mustCols      []string     //必须要的列
+	obj           interface{}  `xorm:"-"` //继承者使用该对象
+	id            *int32       `xorm:"-"` //主键编号
+	session       *Session     `xorm:"-"` //数据库会话
+	isRootSession bool         `xorm:"-"` //是否为根会话
+	engine        *xorm.Engine `xorm:"-"` //数据库引擎，默认为配置的数据库引擎
 }
 
 //数据库引擎初始化
@@ -40,14 +48,14 @@ func (this *Model) Engine(arg ...*xorm.Engine) *xorm.Engine {
 }
 
 //事务引擎,如果给了arg参数，则为设置否则new一个session
-func (this *Model) TransactionEngine(arg ...*Session) *Session {
+func (this *Model) SessionEngine(arg ...*Session) *Session {
 	if this.session != nil {
 		return this.session
 	}
 	if len(arg) == 1 {
 		this.session = arg[0]
-	} else if len(arg) == 0 {
-		this.session = newSession()
+	} else {
+		this.session = NewSession(this.engine)
 		this.session.Begin() //开启事务
 		this.isRootSession = true
 	}
@@ -59,55 +67,127 @@ func (this *Model) AutoCommit() error {
 	return this.session.autoCommit(this.isRootSession)
 }
 
+func (this *Model) Omit(omit ...string) *Model {
+	this.omit = omit
+	return this
+}
+func (this *Model) Cols(cols ...string) *Model {
+	this.cols = cols
+	return this
+}
+func (this *Model) MustCols(cols ...string) *Model {
+	this.mustCols = cols
+	return this
+}
+func (this *Model) initSqlArr() {
+	this.mustCols = []string{}
+	this.cols = []string{}
+	this.omit = []string{}
+}
+
 //获取模型的数据，如果给了参数则将查询结果返回该参数，否则将查询的结果映射到默认的obj
-func (this *Model) Info(arg ...interface{}) (bool, error) {
+func (this *Model) Info(arg ...interface{}) (err error) {
 	obj := this.obj
 	if len(arg) == 1 {
 		obj = arg[0]
 	}
-	return this.Engine().Id(this.id).Get(obj)
+	var b bool
+	b, err = this.Engine().Id(this.id).Get(obj)
+	if !b && err == nil {
+		err = DO_FAIL
+	}
+	return
+}
+
+//获取模型的数据，如果给了参数则将查询结果返回该参数，否则将查询的结果映射到默认的obj
+//不指定id查询，可以多个条件
+func (this *Model) Infoi(arg ...interface{}) (err error) {
+	obj := this.obj
+	if len(arg) == 1 {
+		obj = arg[0]
+	}
+	var b bool
+	b, err = this.Engine().Get(obj)
+	if !b && err == nil {
+		err = DO_FAIL
+	}
+	return
+}
+
+//根据当前环境获取数据库session
+func (this *Model) getsession() *xorm.Session {
+	var sess *xorm.Session
+	if this.session != nil {
+		sess = this.session.Cols()
+	} else {
+		sess = this.Engine().Cols()
+	}
+	if len(this.mustCols) > 0 {
+		sess.MustCols(this.mustCols...)
+	}
+	if len(this.cols) > 0 {
+		sess.Cols(this.cols...)
+	}
+	if len(this.omit) > 0 {
+		sess.Omit(this.omit...)
+	}
+	return sess
 }
 
 //添加数据，如果使用了TransactionEngine,则使用session操作，默认使用Engine()
-func (this *Model) Add() (int64, error) {
-	if this.session != nil {
-		return this.session.InsertOne(this.obj)
+//可以在add前调用回调修改参数
+func (this *Model) Add() (err error) {
+	var aff int64
+	sess := this.getsession()
+	aff, err = sess.InsertOne(this.obj)
+	this.initSqlArr()
+	if aff == 1 && err == nil {
+		return nil
 	}
-	return this.Engine().InsertOne(this.obj)
+	if aff == 0 && err == nil {
+		err = DO_INVALID
+	}
+	return err
 }
 
 //修改数据，如果使用了TransactionEngine,则使用session操作，默认使用Engine()
-func (this *Model) Modify() (err error) {
+func (this *Model) Mod() (err error) {
 	var aff int64
-	if this.session != nil {
-		aff, err = this.session.Id(this.id).Update(this.obj)
-	} else {
-		aff, err = this.Engine().Id(this.id).Update(this.obj)
+	sess := this.getsession()
+	aff, err = sess.Id(this.id).Update(this.obj)
+	this.initSqlArr()
+	if aff == 1 && err == nil {
+		return nil
 	}
-	if aff != 1 {
-		err = errors.New("修改失败")
+	if aff == 0 && err == nil {
+		err = DO_INVALID
 	}
 	return err
 }
 
 //删除数据，如果使用了TransactionEngine,则使用session操作，默认使用Engine()
-func (this *Model) Delete() (err error) {
+func (this *Model) Del() (err error) {
 	var aff int64
-	if this.session != nil {
-		aff, err = this.session.Id(this.id).Delete(this.obj)
-	} else {
-		aff, err = this.Engine().Id(this.id).Delete(this.obj)
+	sess := this.getsession()
+	aff, err = sess.Id(this.id).Delete(this.obj)
+	this.initSqlArr()
+	if aff == 1 && err == nil {
+		return nil
 	}
-	if aff != 1 {
-		err = errors.New("删除失败")
+	if aff == 0 && err == nil {
+		err = DO_INVALID
 	}
 	return err
 }
 
 //计算分页
-//参数：totle=总记录数量，current=当前页码，limit=每一页数量
+//参数：query=查询参数，obj=查询对象，current=当前页码，limit=每一页数量
 //返回：p=分页数据，start=sql查询limit起点
-func (this *Model) Page(totle, current, limit int) (p *Page, start int) {
+func (this *Model) Page(query *xorm.Session, obj interface{}, current, limit int) (p *Page, start int) {
+	totle, err := query.Clone().Count(obj)
+	if err != nil {
+		return
+	}
 	p = new(Page)
 	p.Pages = int(math.Ceil(float64(totle) / float64(limit))) //计算出页码
 	if current <= 1 {                                         //页首不越界
@@ -116,11 +196,16 @@ func (this *Model) Page(totle, current, limit int) (p *Page, start int) {
 	if current >= p.Pages { //页末不越界
 		current = p.Pages
 	}
-	p.Totle = totle
+	p.Totle = int(totle)
 	p.Limit = limit
 	p.Current = current
 	start = (current - 1) * limit
 	return
+}
+
+//实例化使用map保存数据的engine
+func (this *Model) Mysql(engine *xorm.Engine, table string) *Mysql {
+	return Mysql{Engine: engine, table: table}.New()
 }
 
 //------------------------------------------------------------------------------
@@ -128,23 +213,25 @@ func (this *Model) Page(totle, current, limit int) (p *Page, start int) {
 //数据库会话，当使用事务的时候比用
 type Session struct {
 	xorm.Session      //继承xorm的session
-	isHandleOK   bool //是否提交成功
+	isSuccess    bool //是否提交成功
 }
 
-func newSession() *Session {
+func NewSession(eg *xorm.Engine) *Session {
 	o := new(Session)
+	o.Engine = eg
+	o.Init()
 	return o
 }
 
 //自动判断是否事务提交成功，必须是在root下生成的事务才有效
 func (this *Session) autoCommit(isRoot bool) error {
-	if isRoot && this.isHandleOK {
+	if isRoot && this.isSuccess {
 		return this.Commit()
 	}
 	return nil
 }
 
 //会话处理成功
-func (this *Session) HandleOK() {
-	this.isHandleOK = true
+func (this *Session) Success() {
+	this.isSuccess = true
 }
